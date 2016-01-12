@@ -16,4 +16,6 @@ const (
 	modeOpt = "_mode"
 	// The default macvlan mode
 	defaultMacvlanMode = "l2"
+	// l3 mode routing manager
+	routingManagerOpt = "routingmanager"
 )

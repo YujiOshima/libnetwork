@@ -59,6 +59,7 @@ type networkConfiguration struct {
 	DefaultGatewayIPv6 net.IP
 	HostIface          string
 	IpvlanMode         string
+	RoutingManager     string
 }
 
 type subnet struct {

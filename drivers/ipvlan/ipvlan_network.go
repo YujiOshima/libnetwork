@@ -2,9 +2,9 @@ package ipvlan
 
 import (
 	"fmt"
-
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/driverapi"
+	"github.com/docker/libnetwork/drivers/ipvlan/routing"
 	"github.com/docker/libnetwork/netlabel"
 	"github.com/docker/libnetwork/options"
 	"github.com/docker/libnetwork/types"
@@ -41,6 +41,10 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, ipV4Dat
 		netConfig: config,
 	}
 
+	if config.IpvlanMode == modeL3 && config.RoutingManager != "" {
+		routingmanager.InitRoutingManager(config.HostIface, config.RoutingManager, "127.0.0.1")
+		go routingmanager.StartMonitoring()
+	}
 	for _, ipd := range ipV4Data {
 		s := &subnet{
 			subnetIP: ipd.Pool,
@@ -49,6 +53,13 @@ func (d *driver) CreateNetwork(id string, option map[string]interface{}, ipV4Dat
 		n.subnets = append(n.subnets, s)
 		logrus.Debugf("Network added [Network_Type: %s, Mode: %s, Subnet: %s, Gateway %s, Host_Interface: %s] ",
 			networkType, n.netConfig.IpvlanMode, s.subnetIP.String(), s.gwIP.String(), n.netConfig.HostIface)
+		if config.IpvlanMode == modeL3 && config.RoutingManager != "" {
+			err := routingmanager.AdvertizeNewRoute(s.subnetIP)
+			if err != nil {
+				fmt.Errorf("Error installing container route : %s", err)
+			}
+		}
+
 	}
 	d.addNetwork(n)
 	return nil
@@ -62,6 +73,15 @@ func (d *driver) DeleteNetwork(nid string) error {
 	n := d.network(nid)
 	if n == nil {
 		return fmt.Errorf("could not find network with id %s", nid)
+	}
+	if n.netConfig.IpvlanMode == modeL3 && n.netConfig.RoutingManager != "" {
+		for _, subnet := range n.subnets {
+			err := routingmanager.WithdrawRoute(subnet.subnetIP)
+			if err != nil {
+				fmt.Errorf("Error withdrawing container route : %s", err)
+			}
+		}
+
 	}
 	d.deleteNetwork(nid)
 	return nil
@@ -176,6 +196,10 @@ func (c *networkConfiguration) fromLabels(labels map[string]string) error {
 		case driverModeOpt:
 			c.IpvlanMode = value
 			logrus.Debugf("Driver %s mode type is: %s", networkType, value)
+
+		case routingManagerOpt:
+			c.RoutingManager = value
+
 		}
 	}
 
