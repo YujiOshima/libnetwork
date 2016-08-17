@@ -32,6 +32,7 @@ type BgpRouteManager struct {
 	asnum         int
 	rasnum        int
 	neighborlist  []string
+	pathUuidlist  map[string][]byte
 }
 
 // NewBgpRouteManager initialize route manager
@@ -51,6 +52,7 @@ func NewBgpRouteManager(as string, ras string) *BgpRouteManager {
 		asnum:         a,
 		rasnum:        ra,
 		learnedRoutes: make(map[string]*ribLocal),
+		pathUuidlist:  make(map[string][]byte),
 	}
 	b.bgpServer = bgpserver.NewBgpServer()
 	go b.bgpServer.Serve()
@@ -111,10 +113,10 @@ func (b *BgpRouteManager) CreateVrfNetwork(parentIface string, vpnID string) err
 	if err != nil {
 		return err
 	}
-	go func() {
-		err := b.monitorBestPath(vpnID)
-		log.Errorf("faital monitoring VpnID %s rib : %v", vpnID, err)
-	}()
+	//	go func() {
+	//		err := b.monitorBestPath(vpnID)
+	//		log.Errorf("faital monitoring VpnID %s rib : %v", vpnID, err)
+	//	}()
 	return nil
 }
 
@@ -195,7 +197,17 @@ func (b *BgpRouteManager) monitorBestPath(VpnID string) error {
 			switch msg := ev.(type) {
 			case *bgpserver.WatchEventBestPath:
 				for _, path := range msg.PathList {
-					log.Debugf("%v", path)
+					vpnid := "global"
+					log.Debugf("Update BGP path %v", path)
+					for _, attr := range path.GetPathAttrs() {
+						if attr.GetType() == bgp.BGP_ATTR_TYPE_EXTENDED_COMMUNITIES {
+							for _, extcomm := range attr.(*bgp.PathAttributeExtendedCommunities).Value {
+								extcommStrs := strings.Split(extcomm.String(), ":")
+								vpnid = extcommStrs[len(extcommStrs)-1]
+							}
+						}
+					}
+					b.handleRibUpdate(&rib{path: path, vpnID: vpnid})
 				}
 			}
 		}
@@ -205,14 +217,27 @@ func (b *BgpRouteManager) monitorBestPath(VpnID string) error {
 
 // AdvertiseNewRoute advetise the local namespace IP prefixes to the bgp neighbors
 func (b *BgpRouteManager) AdvertiseNewRoute(localPrefix string, VpnID string) error {
+	var err error
 	log.Debugf("Adding this hosts container network [ %s ] into the BGP domain", localPrefix)
-	_, localPrefixCIDR, _ := net.ParseCIDR(localPrefix)
+	_, localPrefixCIDR, err := net.ParseCIDR(localPrefix)
+	if err != nil {
+		return err
+	}
 	localPrefixMask, _ := localPrefixCIDR.Mask.Size()
 	attrs := []bgp.PathAttributeInterface{
 		bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_IGP),
 		bgp.NewPathAttributeNextHop("0.0.0.0"),
 	}
-	_, err := b.bgpServer.AddPath(bgpVrfprefix+VpnID, []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(localPrefixMask), localPrefixCIDR.IP.String()), false, attrs, time.Now(), false)})
+	if VpnID == "" {
+		var uuid []byte
+		uuid, err = b.bgpServer.AddPath("", []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(localPrefixMask), localPrefixCIDR.IP.String()), false, attrs, time.Now(), false)})
+		b.pathUuidlist[localPrefix] = uuid
+	} else {
+		var uuid []byte
+		rdrtstr := strconv.Itoa(b.asnum) + ":" + VpnID
+		uuid, err = b.bgpServer.AddPath(bgpVrfprefix+VpnID, []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(localPrefixMask), localPrefixCIDR.IP.String()), false, attrs, time.Now(), false)})
+		b.pathUuidlist[rdrtstr+localPrefix] = uuid
+	}
 	if err != nil {
 		return err
 	}
@@ -221,14 +246,18 @@ func (b *BgpRouteManager) AdvertiseNewRoute(localPrefix string, VpnID string) er
 
 //WithdrawRoute withdraw the local namespace IP prefixes to the bgp neighbors
 func (b *BgpRouteManager) WithdrawRoute(localPrefix string, VpnID string) error {
+	var err error
 	log.Debugf("Withdraw this hosts container network [ %s ] from the BGP domain", localPrefix)
-	_, localPrefixCIDR, _ := net.ParseCIDR(localPrefix)
-	localPrefixMask, _ := localPrefixCIDR.Mask.Size()
-	attrs := []bgp.PathAttributeInterface{
-		bgp.NewPathAttributeOrigin(bgp.BGP_ORIGIN_ATTR_TYPE_IGP),
-		bgp.NewPathAttributeNextHop("0.0.0.0"),
+	if VpnID == "" {
+		uuid := b.pathUuidlist[localPrefix]
+		err = b.bgpServer.DeletePath(uuid, 0, "", nil)
+		delete(b.pathUuidlist, localPrefix)
+	} else {
+		rdrtstr := strconv.Itoa(b.asnum) + ":" + VpnID
+		uuid := b.pathUuidlist[rdrtstr+localPrefix]
+		err = b.bgpServer.DeletePath(uuid, 0, bgpVrfprefix+VpnID, nil)
+		delete(b.pathUuidlist, rdrtstr+localPrefix)
 	}
-	err := b.bgpServer.DeletePath(nil, 0, bgpVrfprefix+VpnID, []*table.Path{table.NewPath(nil, bgp.NewIPAddrPrefix(uint8(localPrefixMask), localPrefixCIDR.IP.String()), true, attrs, time.Now(), false)})
 	if err != nil {
 		return err
 	}
@@ -323,35 +352,19 @@ func (b *BgpRouteManager) DiscoverDelete(isself bool, Address string) error {
 
 	return nil
 }
-func (cache *ribCache) handleBgpRibMonitor(routeMonitor *table.Path, VpnID string) (*ribLocal, error) {
+func (cache *ribCache) handleBgpRibMonitor(route *table.Path, VpnID string) (*ribLocal, error) {
 	ribLocal := &ribLocal{}
-	nlri := routeMonitor.GetNlri()
-
+	nlri := route.GetNlri()
 	if nlri != nil {
-		if VpnID == "global" {
-			bgpPrefix, err := parseIPNet(nlri.String())
-			if err != nil {
-				log.Errorf("Error parsing the bgp update prefix: %s", nlri.String())
-				return nil, err
-			}
-			ribLocal.BgpPrefix = bgpPrefix
-
-		} else {
-			nlriSplit := strings.Split(nlri.String(), ":")
-			if VpnID != nlriSplit[1] {
-				return nil, nil
-			}
-			bgpPrefix, err := parseIPNet(nlriSplit[len(nlriSplit)-1])
-			if err != nil {
-				log.Errorf("Error parsing the bgp update vpn prefix: %s", nlriSplit[len(nlriSplit)-1])
-				return nil, err
-			}
-			ribLocal.BgpPrefix = bgpPrefix
-
+		bgpPrefix, err := parseIPNet(nlri.String())
+		if err != nil {
+			log.Errorf("Error parsing the bgp update prefix: %s", nlri.String())
+			return nil, err
 		}
+		ribLocal.BgpPrefix = bgpPrefix
 	}
 	log.Debugf("BGP update for prefix: [ %s ] ", nlri.String())
-	for _, attr := range routeMonitor.GetPathAttrs() {
+	for _, attr := range route.GetPathAttrs() {
 		log.Debugf("Type: [ %d ] ,Value [ %s ]", attr.GetType(), attr.String())
 		switch attr.GetType() {
 		case bgp.BGP_ATTR_TYPE_ORIGIN:
